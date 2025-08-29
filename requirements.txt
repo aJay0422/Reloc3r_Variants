@@ -1,0 +1,12 @@
+roma
+gradio
+matplotlib
+tqdm
+opencv-python
+scipy
+einops
+tensorboard
+pyglet<2
+huggingface-hub[torch]>=0.22
+imagesize
+open3d
