@@ -33,8 +33,10 @@ def posemb_sincos(
 
 class Reloc3rWithDiffusionHead(nn.Module):
     def __init__(self,):
+        super().__init__()
+
         self.backbone = Reloc3rRelpose_Almost(img_size=512)
-        self.output_dim = self.backbone.head.proj.out_features
+        self.output_dim = self.backbone.pose_head.proj.out_features
         self.pose_dim = 12
 
         self.pose_in_proj = nn.Linear(self.pose_dim, self.output_dim)
@@ -114,7 +116,8 @@ class Reloc3rWithDiffusionHead(nn.Module):
 
     def forward(self, view1, view2):
         # Embed image features
-        image_features1, image_features2 = self.backbone(view1, view2)
+        out1, out2 = self.backbone(view1, view2)
+        image_features1, image_features2 = out1["features"], out2["features"]
 
         raise NotImplementedError("Loss computation not implemented")
 

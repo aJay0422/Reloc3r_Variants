@@ -6,6 +6,8 @@ import src.reloc3r_variants.models.reloc3r_modules.path_to_reloc3r
 from third_party.reloc3r.reloc3r.patch_embed import ManyAR_PatchEmbed
 from third_party.reloc3r.reloc3r.reloc3r_relpose import Reloc3rRelpose
 from third_party.reloc3r.reloc3r.pose_head import PoseHead
+from third_party.reloc3r.reloc3r.utils.misc import transpose_to_landscape
+
 
 
 import torch
@@ -200,13 +202,17 @@ class PoseHead_Almost(PoseHead):
 
         feat = self.more_mlps(feat)  # [B, D_]
 
-        return feat
+        return {
+            "features": feat,
+            "pose": torch.empty(1),  # dummy, used to trick tranposed function from reloc3r
+        }
 
 
 class Reloc3rRelpose_Almost(Reloc3rRelpose):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.head = PoseHead_Almost(net=self)
+        self.pose_head = PoseHead_Almost(net=self)
+        self.head = transpose_to_landscape(self.pose_head, activate=True)
 
         self.initialize_weights()
 
