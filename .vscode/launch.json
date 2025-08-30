@@ -1,0 +1,23 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "train_Reloc3rWithDiffusionHead",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/reloc3r_variants/train/train_Reloc3rWithDiffusionHead.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RANK": "0",
+                "WORLD_SIZE": "1",
+                "LOCAL_RANK": "0",
+                "MASTER_ADDR": "localhost",
+                "MASTER_PORT": "12355"  
+            },
+        }
+    ]
+}

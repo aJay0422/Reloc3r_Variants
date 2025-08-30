@@ -52,10 +52,10 @@ def compute_gt_poses(view1, view2):
 
 
 class Reloc3rWithDiffusionHead(nn.Module):
-    def __init__(self,):
+    def __init__(self, img_size=512):
         super().__init__()
 
-        self.backbone = Reloc3rRelpose_Almost(img_size=512)
+        self.backbone = Reloc3rRelpose_Almost(img_size=img_size)
         self.output_dim = self.backbone.pose_head.proj.out_features
         self.pose_dim = 12
 
