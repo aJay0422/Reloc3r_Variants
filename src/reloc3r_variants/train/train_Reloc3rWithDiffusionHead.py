@@ -1,6 +1,8 @@
 import argparse
+import json
 import os
 import sys
+import wandb
 from pathlib import Path
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
@@ -10,8 +12,9 @@ import torch
 import torch.backends.cudnn as cudnn
 
 import third_party.reloc3r.croco.utils.misc as misc
-# from third_party.reloc3r.croco.utils import misc as misc
 
+
+from third_party.reloc3r.croco.utils.misc import NativeScalerWithGradNormCount as NativeScaler
 from src.reloc3r_variants.data.utils import build_dataset
 from src.reloc3r_variants.models.Reloc3rWithDiffusionHead import Reloc3rWithDiffusionHead
 
@@ -21,13 +24,13 @@ def get_args_parser():
 
     # wandb arguments
     parser.add_argument('--entity', default="mtang4ucmerced-ucmerced")
-    parser.add_argument('--project', default="Reloc3r_Variants")
+    parser.add_argument('--project', default="Reloc3r")
     parser.add_argument('--exp_name', default="Reloc3rWithDiffusionHead")
 
     # model
     parser.add_argument('--model', default="Reloc3rWithDiffusionHead(img_size=512)",
                         help="string containing the model to build")
-    parser.add_argument('--pretrained', default=None,
+    parser.add_argument('--pretrained', default="checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth",
                         help="path of a starting checkpoint")
     
     # datasets
@@ -109,10 +112,87 @@ def train(args):
 
     if args.pretrained and not args.resume:
         print('Loading pretrained: ', args.pretrained)
-        ckpt = torch.load(args.pretrained, map_location=device)
-        # modify ckpt keys for Reloc3rWithDiffusionHead
-        pass
+        ckpt = torch.load(args.pretrained, map_location=device, weights_only=False)
 
+        if "DUSt3R" in args.pretrained:
+            # Initialize Reloc3r Encoder-Decoder from DUSt3R weights
+            # modify ckpt keys for Reloc3rWithDiffusionHead
+            modified_ckpt = {}
+            for k, v in ckpt['model'].items():
+                if k.startswith("dec_blocks."):
+                    continue
+                new_k = k.replace("dec_blocks2", "dec_blocks", 1)
+                modified_ckpt[new_k] = v
+            model_without_ddp.backbone.load_state_dict(modified_ckpt, strict=False)
+            del ckpt
+            del modified_ckpt
+        else:
+            model_without_ddp.backbone.load_state_dict(ckpt, strict=False)
+
+    if args.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[args.gpu], find_unused_parameters=True, static_graph=True)
+        model_without_ddp = model.module
+
+    eff_batch_size = args.batch_size * args.accum_iter * world_size
+    if args.lr is None:
+        args.lr = args.blr * eff_batch_size / 256
+    print("base lr: %.2e" % (args.lr * 256 / eff_batch_size))
+    print("actual lr: %.2e" % args.lr)
+    print("accumulate grad iterations: %d" % args.accum_iter)
+    print("effective batch size: %d" % eff_batch_size)
+
+    # frozen weights and define optimizer
+    frozen_keys = ["patch_embed", "rope", "enc_blocks", "enc_norm"]
+    for k, p in model_without_ddp.backbone.named_parameters():
+        if any(k.startswith(sk) for sk in frozen_keys):
+            p.requires_grad = False
+    param_groups = misc.get_parameter_groups(model_without_ddp, args.weight_decay)
+    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+    print(optimizer)
+    loss_scaler = NativeScaler()
+
+    def write_log_stats(epoch, train_stats, test_stats):
+        if misc.is_main_process():
+            log_stats = dict(epoch=epoch, **{f'train_{k}': v for k, v in train_stats.items()})
+            for test_name in data_loader_test:
+                if test_name not in test_stats:
+                    continue
+                log_stats.update({test_name + '_' + k: v for k, v in test_stats[test_name].items()})
+            with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
+                f.write(json.dumps(log_stats) + "\n")
+
+    def save_model(epoch, fname, best_so_far):
+        misc.save_model(
+            args=args, model_without_ddp=model_without_ddp, optimizer=optimizer,
+            loss_scaler=loss_scaler, epoch=epoch, fname=fname, best_so_far=best_so_far
+        )
+
+    def save_final_model(args, epoch, model_without_ddp, best_so_far=None):
+        output_dir = Path(args.output_dir)
+        checkpoint_path = output_dir / 'checkpoint-final.pth'
+        to_save = {
+            'args': args,
+            'model': model_without_ddp if isinstance(model_without_ddp, dict) else model_without_ddp.cpu().state_dict(),
+            'epoch': epoch
+        }
+        if best_so_far is not None:
+            to_save['best_so_far'] = best_so_far
+        print(f'>> Saving model to {checkpoint_path} ...')
+        misc.save_on_master(to_save, checkpoint_path)
+
+    best_so_far = misc.load_model(
+        args=args, model_without_ddp=model_without_ddp, optimizer=optimizer, loss_scaler=loss_scaler
+    )
+    if best_so_far is None:
+        best_so_far = float('inf')
+    log_writer = None
+    if global_rank == 0 and args.output_dir is not None:
+        log_writer = wandb.init(
+            entity=args.entity, project=args.project, name=args.exp_name, config=args
+        )
+
+    raise NotImplementedError("Not fully implemented yet")
 
 
 
