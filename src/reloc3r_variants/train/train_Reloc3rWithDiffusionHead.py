@@ -22,7 +22,8 @@ import third_party.reloc3r.croco.utils.misc as misc
 from third_party.reloc3r.croco.utils.misc import NativeScalerWithGradNormCount as NativeScaler
 from src.reloc3r_variants.data.utils import build_dataset
 from src.reloc3r_variants.models.Reloc3rWithDiffusionHead import Reloc3rWithDiffusionHead
-from .utils import get_aucs
+from src.reloc3r_variants.train.utils import get_aucs
+
 
 def get_args_parser():
     parser = argparse.ArgumentParser("Train Reloc3rWithDiffusionHead Model")

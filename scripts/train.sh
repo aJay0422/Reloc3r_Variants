@@ -1,6 +1,6 @@
 CUDA_VISIBLE_DEVICES=1,2,3,4,5,6
 torchrun --nproc_per_node=6 src/reloc3r_variants/train/train_Reloc3rWithDiffusionHead.py \
-    --exp_name="reloc3r+diffusionhead-megadepth-6gpus-bs16 \
+    --exp_name="reloc3r+diffusionhead-megadepth-6gpus-bs16" \
     --batch_size=16 \
     --accum_iter=2 \
     --epochs=100 \
