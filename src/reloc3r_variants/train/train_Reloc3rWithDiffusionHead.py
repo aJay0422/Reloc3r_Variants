@@ -1,9 +1,14 @@
 import argparse
+import datetime
 import json
+import math
 import os
 import sys
+import time
 import wandb
+from collections import defaultdict
 from pathlib import Path
+from typing import Sized
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..')))
 
@@ -17,7 +22,7 @@ import third_party.reloc3r.croco.utils.misc as misc
 from third_party.reloc3r.croco.utils.misc import NativeScalerWithGradNormCount as NativeScaler
 from src.reloc3r_variants.data.utils import build_dataset
 from src.reloc3r_variants.models.Reloc3rWithDiffusionHead import Reloc3rWithDiffusionHead
-
+from .utils import get_aucs
 
 def get_args_parser():
     parser = argparse.ArgumentParser("Train Reloc3rWithDiffusionHead Model")
@@ -39,7 +44,7 @@ def get_args_parser():
     
     # training
     parser.add_argument('--seed', default=42, type=int, help="Random seed")
-    parser.add_argument('--batch_size', default=64, type=int,
+    parser.add_argument('--batch_size', default=16, type=int,
                         help="Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus)")
     parser.add_argument('--accum_iter', default=1, type=int,
                         help="Accumulate gradient iterations (for increasing the effective batch size under memory constraints)")
@@ -65,6 +70,14 @@ def get_args_parser():
     parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')
     parser.add_argument('--local_rank', default=-1, type=int)
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
+
+    parser.add_argument('--eval_freq', type=int, default=1, help='Test loss evaluation frequency')
+    parser.add_argument('--save_freq', default=1, type=int,
+                        help='frequence (number of epochs) to save checkpoint in checkpoint-last.pth')
+    parser.add_argument('--keep_freq', default=20, type=int,
+                        help='frequence (number of epochs) to save checkpoint in checkpoint-%d.pth')
+    parser.add_argument('--print_freq', default=20, type=int,
+                        help='frequence (number of iterations) to print infos while training')
 
     # output dir
     parser.add_argument('--output_dir', default='./output/', type=str, help="path where to save the output")
@@ -192,8 +205,190 @@ def train(args):
             entity=args.entity, project=args.project, name=args.exp_name, config=args
         )
 
-    raise NotImplementedError("Not fully implemented yet")
 
+    start_time = time.time()
+    train_stats = test_stats = {}
+    for epoch in range(args.start_epoch, args.epochs):
+        if epoch > args.start_epoch:
+            if args.save_freq and epoch % args.save_freq == 0 or epoch == args.epochs:
+                save_model(epoch - 1, 'last', best_so_far)
+
+        # Test on multiple datasets
+        new_best = False
+        if (epoch > 0 and args.eval_freq > 0 and epoch % args.eval_freq == 0):
+            test_stats = {}
+            for test_name, testset in data_loader_test.items():
+                stats = test_one_epoch(
+                    model, testset, device, epoch, log_writer=log_writer, args=args, prefix=test_name,
+                )
+                test_stats[test_name] = stats
+
+                # Save best of all
+                if stats['loss_med'] < best_so_far:
+                    best_so_far = stats['loss_med']
+                    new_best = True
+
+        write_log_stats(epoch, train_stats, test_stats)
+
+        if epoch > args.start_epoch:
+            if args.keep_freq and epoch % args.keep_freq == 0:
+                save_model(epoch - 1, str(epoch), best_so_far)
+            if new_best:
+                save_model(epoch - 1, 'best', best_so_far)
+        if epoch >= args.epochs:
+            break 
+
+        # Train
+        train_stats = train_one_epoch(
+            model, data_loader_train, optimizer, device, epoch, loss_scaler, log_writer=log_writer, args=args
+        )
+
+        total_time = time.time() - start_time
+        total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+        print('Training time {}'.format(total_time_str))
+        save_final_model(args, args.epochs, model_without_ddp, best_so_far=best_so_far)
+
+    if log_writer is not None:
+        log_writer.finish()
+
+
+def train_one_epoch(
+    model: torch.nn.Module,
+    data_loader: Sized,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epoch: int,
+    loss_scaler,
+    args,
+    log_writer=None,
+):
+    model.train(True)
+    metric_logger = misc.MetricLogger(delimiter="  ")
+    metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    header = 'Epoch: [{}]'.format(epoch)
+    accum_iter = args.accum_iter
+
+    if hasattr(data_loader, 'dataset') and hasattr(data_loader.dataset, 'set_epoch'):
+        data_loader.dataset.set_epoch(epoch)
+    if hasattr(data_loader, 'sampler') and hasattr(data_loader.sampler, 'set_epoch'):
+        data_loader.sampler.set_epoch(epoch)
+
+    optimizer.zero_grad()
+    for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
+        epoch_f = epoch + data_iter_step / len(data_loader)
+        # lr scheduler
+        if data_iter_step % accum_iter == 0:
+            lr = misc.adjust_learning_rate(optimizer, epoch_f, args)
+        loss_tuple = loss_of_one_batch(batch, model, device, symmetrize_batch=True, use_amp=bool(args.amp), ret='loss', mode='train')
+        loss, loss_details = loss_tuple
+        loss_value = float(loss)
+
+        if not math.isfinite(loss_value):
+            print("Loss is {}, stopping training".format(loss_value), force=True)
+            sys.exit(1)
+
+        loss /= accum_iter
+        loss_scaler(loss, optimizer, parameters=model.parameters(), update_grad=(data_iter_step + 1) % accum_iter == 0)
+        if (data_iter_step + 1) % accum_iter == 0:
+            optimizer.zero_grad()
+
+        del loss
+        del batch
+        
+        lr = optimizer.param_groups[0]["lr"]
+        metric_logger.update(epoch=epoch_f)
+        metric_logger.update(lr=lr)
+        metric_logger.update(loss=loss_value, **loss_details)
+        
+        if (data_iter_step + 1) % accum_iter == 0 and ((data_iter_step + 1) % (accum_iter * args.print_freq)) == 0:
+            loss_value_reduce = misc.all_reduce_mean(loss_value)  # MUST BE EXECUTED BY ALL NODES
+            if log_writer is None:
+                continue
+            """ We use epoch_1000x as the x-axis in tensorboard.
+            This calibrates different curves when batch size changes.
+            """
+            epoch_1000x = int(epoch_f * 1000)
+            log_writer.log({'training/train_loss': loss_value_reduce,
+                            'training/train_lr': lr,
+                            'training/train_iter': epoch_1000x}, 
+                           step=epoch_1000x)
+            for name, val in loss_details.items():
+                log_writer.log({f'training/train_{name}': val}, step=epoch_1000x)
+
+    # gather the stats from all processes
+    metric_logger.synchronize_between_processes()
+    print("Averaged stats:", metric_logger)
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+
+
+def loss_of_one_batch(batch, model, device, symmetrize_batch=False, use_amp=False, ret=None, mode=None):
+    view1, view2 = batch
+    ignore_keys = set(['depthmap', 'dataset', 'label', 'instance', 'idx', 'true_shape', 'rng'])
+    for view in batch:
+        for name in view.keys():
+            if name in ignore_keys:
+                continue
+        view[name] = view[name].to(device, non_blocking=True)
+
+    if mode == 'train':
+        # forward model to get the noise prediction loss
+        with torch.amp.autocast(device_type="cuda", enabled=bool(use_amp)):
+            noise_pred_loss = model(view1, view2)
+            loss_details = {'noise_pred_loss': float(noise_pred_loss)}
+            loss = (noise_pred_loss, loss_details)
+            result = dict(view1=view1, view2=view2, loss=loss)
+            return result[ret] if ret else result
+    elif mode == 'eval':
+        # sample action to get the pose prediction loss
+        with torch.no_grad():
+            with torch.amp.autocast(device_type="cuda", enabled=bool(use_amp)):
+                sampled_pose2to1, gt_pose2to1 = model.sample_pose(view1, view2) # (B, 4, 4), after svd orthogonalization
+                aucs = get_aucs(sampled_pose2to1, gt_pose2to1)
+                return aucs["auc@20"], aucs
+    else:
+        raise ValueError("mode should be 'train' or 'eval'")
+    
+
+@torch.no_grad()
+def test_one_epoch(
+    model: torch.nn.Module,
+    data_loader: Sized,
+    device: torch.device,
+    epoch: int,
+    args,
+    log_writer=None,
+    prefix='test',
+):
+    model = model.to(device)
+    model.eval()
+    metric_logger = misc.MetricLogger(delimiter="  ")
+    metric_logger.meters = defaultdict(lambda: misc.SmoothedValue(window_size=9**9))
+    header = 'Test Epoch: [{}]'.format(epoch)
+
+    if hasattr(data_loader, 'dataset') and hasattr(data_loader.dataset, 'set_epoch'):
+        data_loader.dataset.set_epoch(epoch)
+    if hasattr(data_loader, 'sampler') and hasattr(data_loader.sampler, 'set_epoch'):
+        data_loader.sampler.set_epoch(epoch)
+
+    for _, batch in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
+        loss_tuple = loss_of_one_batch(batch, model, device,
+                                       symmetrize_batch=True,
+                                       use_amp=bool(args.amp), ret='loss', mode='eval')
+        loss_value, loss_details = loss_tuple  # criterion returns two values
+        metric_logger.update(loss=float(loss_value), **loss_details)
+
+    # gather the stats from all processes
+    metric_logger.synchronize_between_processes()
+    print("Averaged stats:", metric_logger)
+
+    aggs = [('avg', 'global_avg'), ('med', 'median')]
+    results = {f'{k}_{tag}': getattr(meter, attr) for k, meter in metric_logger.meters.items() for tag, attr in aggs}
+
+    if log_writer is not None:
+        for name, val in results.items():
+            log_writer.log({f"{prefix}/{name}": val}, step=1000*epoch)
+
+    return results
 
 
 

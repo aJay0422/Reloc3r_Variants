@@ -31,14 +31,20 @@ def posemb_sincos(
     return pos_emb
 
 
-def compute_gt_poses(view1, view2):
+def compute_gt_poses(view1, view2, mode="12"):
     """
     Compute the two-way relative camera poses between two views.
     Each pose is a vector of length 12, where the first 9 elements are flattened rotation matrix and the last 3 elements are translation vector.
     """
+    assert mode in ["12", "3x4", "4x4"], "argument `mode` must be one of ['12', '3x4', '4x4']"
+
     abs_pose1, abs_pose2 = view1["camera_pose"], view2["camera_pose"]
     gt_pose1to2 = torch.inverse(view2['camera_pose']) @ view1['camera_pose'] # (B, 4, 4)
     gt_pose2to1 = torch.inverse(view1['camera_pose']) @ view2['camera_pose'] # (B, 4, 4)
+    if mode == "4x4":
+        return gt_pose1to2, gt_pose2to1
+    if mode == "3x4":
+        return gt_pose1to2[:, :3, :], gt_pose2to1[:, :3, :]
 
     gt_pose1to2_reshape = torch.zeros(abs_pose1.shape[0], 12, device=abs_pose1.device)
     gt_pose1to2_reshape[:, :9] = gt_pose1to2[:, :3, :3].reshape(abs_pose1.shape[0], 9)
@@ -49,6 +55,44 @@ def compute_gt_poses(view1, view2):
     gt_pose2to1_reshape[:, 9:] = gt_pose2to1[:, :3, 3]
 
     return gt_pose1to2_reshape, gt_pose2to1_reshape
+
+
+def svd_orthogonalize(m):
+    """Convert 9D representation to SO(3) using SVD orthogonalization.
+
+    Args:
+        m: [BATCH, 3, 3] 3x3 matrices.
+
+    Returns:
+        [BATCH, 3, 3] SO(3) rotation matrices.
+    """
+    if m.dim() < 3:
+        m = m.reshape((-1, 3, 3))
+    m_transpose = torch.transpose(torch.nn.functional.normalize(m, p=2, dim=-1), dim0=-1, dim1=-2)
+    u, s, v = torch.svd(m_transpose)
+    det = torch.det(torch.matmul(v, u.transpose(-2, -1)))
+    # Check orientation reflection.
+    r = torch.matmul(
+        torch.cat([v[:, :, :-1], v[:, :, -1:] * det.view(-1, 1, 1)], dim=2),
+        u.transpose(-2, -1)
+    )
+    return r
+
+
+def reshape_and_orthogonalize(pose):
+    """
+    Reshape the pose tensor from (B, 12) to (B, 4, 4). Then use svd orthogonalization to make sure the pose is valid.
+    :param pose: a torch.Tensor of shape (B, 12), where the first 9 elements are rotation matrix and last 3 are translation vector.
+    """
+    pose_reshape = torch.eye(4, device=pose.device).unsqueeze(0).repeat(pose.shape[0], 1, 1) # (B, 4, 4)
+    pose_reshape[:, :3, :3] = pose[:, :9].reshape(pose.shape[0], 3, 3)
+    pose_reshape[:, :3, 3] = pose[:, 9:].reshape(pose.shape[0], 3, 1)
+    pose_reshape = pose_reshape.float()
+
+    # Use SVD to orthogonalize the rotation matrix
+    pose_reshape[:, :3, :3] = svd_orthogonalize(pose_reshape[:, :3, :3])
+
+    return pose_reshape
 
 
 class Reloc3rWithDiffusionHead(nn.Module):
@@ -152,11 +196,14 @@ class Reloc3rWithDiffusionHead(nn.Module):
         return loss1 + loss2
     
 
-    def sample_pose(self, view1, view2, num_steps: int = 50):
+    def sample_pose(self, view1, view2, num_steps: int = 50, seed=42):
         """
         Sample a pose from using the learned velocity model.
         Here we only sample the pose2to1
         """
+        torch.manual_seed(seed)
+        _, gt_pose2to1 = compute_gt_poses(view1, view2, mode="4x4")
+
         # Embed image features ahead
         out1, out2 = self.backbone(view1, view2)
         image_features1, image_features2 = out1["features"], out2["features"]
@@ -190,4 +237,7 @@ class Reloc3rWithDiffusionHead(nn.Module):
         for _ in range(num_steps):
             x_t, t = step(x_t, t)
 
-        return x_t
+        # Reshape and orthogonalize the final output
+        x_t = reshape_and_orthogonalize(x_t)
+
+        return x_t, gt_pose2to1
