@@ -282,7 +282,7 @@ def train_one_epoch(
             lr = misc.adjust_learning_rate(optimizer, epoch_f, args)
         loss_tuple = loss_of_one_batch(batch, model, device, symmetrize_batch=True, use_amp=bool(args.amp), ret='loss', mode='train')
         loss, loss_details = loss_tuple
-        loss_value = float(loss)
+        loss_value = float(loss.detach().cpu())
 
         if not math.isfinite(loss_value):
             print("Loss is {}, stopping training".format(loss_value), force=True)
@@ -335,7 +335,7 @@ def loss_of_one_batch(batch, model, device, symmetrize_batch=False, use_amp=Fals
         # forward model to get the noise prediction loss
         with torch.amp.autocast(device_type="cuda", enabled=bool(use_amp)):
             noise_pred_loss = model(view1, view2)
-            loss_details = {'noise_pred_loss': float(noise_pred_loss)}
+            loss_details = {'noise_pred_loss': float(noise_pred_loss.detach().cpu())}
             loss = (noise_pred_loss, loss_details)
             result = dict(view1=view1, view2=view2, loss=loss)
             return result[ret] if ret else result
@@ -376,7 +376,7 @@ def test_one_epoch(
                                        symmetrize_batch=True,
                                        use_amp=bool(args.amp), ret='loss', mode='eval')
         loss_value, loss_details = loss_tuple  # criterion returns two values
-        metric_logger.update(loss=float(loss_value), **loss_details)
+        metric_logger.update(loss=float(loss_value.detach().cpu()), **loss_details)
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
